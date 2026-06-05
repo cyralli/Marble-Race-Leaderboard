@@ -21,7 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define MAX_BUFFERED_FRAMES 256
+#define MAX_BUFFERED_FRAMES 512
 
 FILE* ffmpeg;
 void ExporterThread(void *arg);
@@ -34,10 +34,10 @@ int count = 0; // Current number of frames in buffer
 HANDLE mutex;  // To prevent thread clashing
 bool isFinished = false;
 
-
-
 int WIDTH, HEIGHT, FPS;
 int frameSize;
+
+char cmd[512];
 
 void StartRecording(int w, int h, int fps) {
     
@@ -49,18 +49,20 @@ void StartRecording(int w, int h, int fps) {
     ringBuffer = (unsigned char*)malloc(frameSize * MAX_BUFFERED_FRAMES);
     
     // create string to command
-    char cmd[512];
+    
     sprintf(cmd, 
     "ffmpeg -y "
-    "-f rawvideo -pix_fmt rgba -s %dx%d -r %d -i - " // video pipe
-    "-i audioresult.wav " // audio file
-    "-vf vflip " // flip video
-    "-c:v libvpx-vp9 -deadline realtime -cpu-used 8 -speed 8 "
-    "-c:a libopus -b:a 128k "
+    "-thread_queue_size 2048 "
+    "-f rawvideo -pix_fmt rgba -s %dx%d -r %d -i - "
+    "-i audioresult.wav "
+    "-vf vflip "
+    "-c:v png "
+    "-c:a pcm_s16le "
     "-map 0:v:0 -map 1:a:0 "
     "-shortest "
-    "-threads 8 -row-mt 1 -pix_fmt yuva420p output.webm", 
-    WIDTH, HEIGHT, FPS);
+    "-max_interleave_delta 0 "
+    "-pix_fmt rgba output.mov", 
+    w, h, fps);
     
     // create pipe
     FILE* ffmpeg = _popen(cmd, "wb");
@@ -72,12 +74,38 @@ void StartRecording(int w, int h, int fps) {
     return;
 }
 
-unsigned char* internalPixels;
 
-void StoreFrame(RenderTexture2D frame) {
-    rlEnableFramebuffer(frame.id); 
-    internalPixels = rlReadTexturePixels(frame.texture.id, WIDTH, HEIGHT, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
-    rlDisableFramebuffer();
+void StoreFrame(RenderTexture2D frame, bool repeated) {
+    static void *internalPixels = NULL;
+    
+    if (!repeated) {
+        if (internalPixels != NULL) {
+            RL_FREE(internalPixels);
+        }
+        
+        rlEnableFramebuffer(frame.id); 
+        internalPixels = rlReadTexturePixels(frame.texture.id, WIDTH, HEIGHT, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        rlDisableFramebuffer();
+    }
+    
+    while (true) {
+        WaitForSingleObject(mutex, INFINITE);
+        if (count < MAX_BUFFERED_FRAMES) { // if theres space in the buffer...
+            void* currentSlot = ringBuffer + (head * frameSize);
+                    
+            if (internalPixels != NULL) {
+                memcpy(currentSlot, internalPixels, frameSize);
+            }
+                    
+            frameBuffer[head] = currentSlot; // transfer to framebuffer
+            head = (head + 1) % MAX_BUFFERED_FRAMES;
+            count++;
+            ReleaseMutex(mutex);
+            break;
+        }
+        ReleaseMutex(mutex);
+        Sleep(1);
+    }
     
     return;
 }
@@ -96,29 +124,6 @@ void EndRecording() {
         
     _pclose(ffmpeg);
 }
-
-void Wait4BufferSpace() {
-    while (true) {
-        WaitForSingleObject(mutex, INFINITE);
-        if (count < MAX_BUFFERED_FRAMES) { // if theres space in the buffer...
-            void* currentSlot = ringBuffer + (head * frameSize);
-                    
-            if (internalPixels != NULL) {
-                memcpy(currentSlot, internalPixels, frameSize);
-                RL_FREE(internalPixels);
-            }
-                    
-            frameBuffer[head] = currentSlot; // transfer to framebuffer
-            head = (head + 1) % MAX_BUFFERED_FRAMES;
-            count++;
-            ReleaseMutex(mutex);
-            break;
-        }
-        ReleaseMutex(mutex);
-        Sleep(1);
-    }
-}
-
 
 // ---------------------------------------------------------------------------------------------------
 
